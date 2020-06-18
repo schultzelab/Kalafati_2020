@@ -1,0 +1,1262 @@
+---
+title: "Kalafati et al., 2020: scATAC-seq of ß-Glucan trained BM GMPs and splenic neutrophils"
+author: "Jonas Schulte-Schrepping"
+date: "June 16th, 2020"
+output: 
+  html_document: 
+    code_download: yes
+    df_print: kable
+    theme: united
+    toc: yes
+    toc_depth: 8
+    toc_float: yes
+---
+
+# Introduction
+
+10X single-cell ATAC-seq of BM GMPs and splenic neutrophils from mice trained with beta-glucan for 7 days. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Global settings
+
+## Install packages
+```{r}
+# devtools::install_github("GreenleafLab/chromVARmotifs", upgrade = "never")
+# BiocManager::install("TxDb.Mmusculus.UCSC.mm10.knownGene", update=FALSE)
+# BiocManager::install("BSgenome.Mmusculus.UCSC.mm10", update=FALSE)
+# BiocManager::install("org.Mm.eg.db", update=FALSE)
+```
+
+
+## Load packages
+
+```{r, message=FALSE}
+library(tidyverse)
+library(cowplot)
+library(clusterProfiler)
+library(ArchR)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(chromVARmotifs)
+library(org.Mm.eg.db)
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+```
+
+## Custom functions
+
+### GSEA
+
+```{r}
+scGSEA <-  function(input,
+                    pvalueCutoff = 0.1,
+                    qvalueCutoff = 0.1){ 
+  
+  results <- list()
+  
+  # Open in Glucan
+  entrez_up <- input[input$Log2FC>0,]$geneId
+  entrez_down <- input[input$Log2FC<0,]$geneId
+  
+  # GO enrichment
+    results$GOup <- as.data.frame(enrichGO(gene = entrez_up,
+                                           universe = present_genes_entrez,
+                                           OrgDb = org.Mm.eg.db,
+                                           ont = "BP",
+                                           pAdjustMethod = "bonferroni",
+                                           pvalueCutoff  = pvalueCutoff,
+                                           qvalueCutoff  = qvalueCutoff,
+                                           readable      = T))
+    
+    results$GOdown <- as.data.frame(enrichGO(gene = entrez_down,
+                                           universe = present_genes_entrez,
+                                           OrgDb = org.Mm.eg.db,
+                                           ont = "BP",
+                                           pAdjustMethod = "bonferroni",
+                                           pvalueCutoff  = pvalueCutoff,
+                                           qvalueCutoff  = qvalueCutoff,
+                                           readable      = T))
+    
+  # KEGG enrichment
+  results$KEGGup <- as.data.frame(enrichKEGG(gene = entrez_up, 
+                                               organism = "mmu",
+                                               universe = present_genes_entrez,
+                                               pAdjustMethod = "bonferroni",
+                                               pvalueCutoff  = pvalueCutoff,
+                                               qvalueCutoff = qvalueCutoff))
+    
+    results$KEGGdown <- as.data.frame(enrichKEGG(gene = entrez_down, 
+                                               organism = "mmu",
+                                               universe = present_genes_entrez,
+                                               pAdjustMethod = "bonferroni",
+                                               pvalueCutoff  = pvalueCutoff,
+                                               qvalueCutoff = qvalueCutoff))
+    return(results)
+}
+```
+
+
+### GSEA DotPlot
+
+```{r}
+dotplotGSEA <- function(x,
+                        show=25,
+                        font.size=10,
+                        title=NULL,
+                        title.size=10,
+                        title.width=100,
+                        order="count"){
+  if(nrow(x)<1){
+    print("No enrichment found.")
+  }else{
+    x <- if(nrow(x)>show){x[c(1:show),]}else{x}
+    if(order=="padj"){
+      x <- x[order(x$Count,decreasing=FALSE),]
+      x$Description <- ifelse(nchar(x$Description)>50,
+                              paste(substr(x$Description, 1, 50),"[...]",sep=""),
+                              x$Description)
+      x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+      x <- x[order(x$p.adjust,decreasing=TRUE),]
+      x$Description <- factor(x$Description, levels = unique(x$Description))
+    }
+    if(order=="count"){
+      x <- x[order(x$Count,decreasing=FALSE),]
+      x$Description <- ifelse(nchar(x$Description)>50,
+                              paste(substr(x$Description, 1, 50),"[...]",sep=""),
+                              x$Description)
+      x$Description <- factor(x$Description, levels = unique(x$Description))
+      x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+    }
+    ggplot(x, aes(x = Count, y = Description, color = p.adjust)) +
+      geom_point(aes(size = Count)) +
+      scale_colour_gradientn(colours=c('red', 
+                                       'orange', 
+                                       'darkblue',
+                                       'darkblue'),
+                             limits=c(0,1),
+                             values   = c(0,0.05,0.2,0.5,1),
+                             breaks   = c(0.05,0.2,1),
+                             labels = format(c(0.05,0.2,1))) +
+      ylab(NULL) +
+      theme_bw() +
+      theme(text = element_text(size=font.size),
+            axis.text.x = element_text(angle = 90)) 
+  }
+}
+```
+
+-------------------------------------------------------------------------------
+
+# ArchR (Greenleaf lab)
+
+Following: 
+
+https://www.archrproject.com/articles/Articles/tutorial.html  and https://www.archrproject.com/bookdown/index.html#sectio.
+
+Global Settings for ArchR
+
+```{r}
+# ArchR::installExtraPackages()
+```
+
+```{r}
+addArchRGenome("mm10")
+set.seed(42)
+addArchRThreads(threads = 32)
+```
+
+## Specify Input fragments files
+
+```{r}
+inputFiles <- c("10X_cellranger/pbs_gmp/outs/fragments.tsv.gz",
+                "10X_cellranger/pbs_neu/outs/fragments.tsv.gz",
+                "10X_cellranger/bgl_GMP/outs/fragments.tsv.gz",
+                "10X_cellranger/bgl_neu/outs/fragments.tsv.gz")
+
+names(inputFiles) <- c("pbs_gmp","pbs_neu","bgl_gmp","bgl_neu")
+
+inputFiles
+```
+
+## Creating Arrow files
+
+```{r}
+ArrowFiles <- createArrowFiles(
+  inputFiles = inputFiles,
+  sampleNames = names(inputFiles),
+  filterTSS = 4, #Dont set this too high because you can always increase later
+  filterFrags = 1000,
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE,
+  verbose = FALSE
+)
+
+ArrowFiles
+```
+
+After Arrow file creation, we can infer potential doublets (a single droplet containing multiple cells) that can confound downstream results. This is done using the addDoubletScores() function.
+
+```{r}
+doubScores <- addDoubletScores(
+  input = ArrowFiles,
+  k = 10, #Refers to how many cells near a "pseudo-doublet" to count.
+  knnMethod = "UMAP", #Refers to the embedding to use for nearest neighbor search.
+  LSIMethod = 1,
+  verbose = FALSE
+)
+```
+
+## Creating an ArchRProject
+
+With our Arrow files in hand, we are now ready to create an ArchRProject. An ArchRProject is associated with a set of Arrow files and is the backbone of nearly all ArchR analyses.
+
+```{r}
+proj <- ArchRProject(
+  ArrowFiles = ArrowFiles,
+  outputDirectory = "ArchR_scATAC_kalafati_200616",
+  copyArrows = TRUE #This is recommened so that you maintain an unaltered copy for later usage.
+)
+```
+
+Add meta data to cells 
+
+```{r}
+proj$cell <- ifelse(grepl("gmp", proj$cellNames),"gmp","neu")
+proj$treatment <- ifelse(grepl("pbs", proj$cellNames),"pbs","bgl")
+```
+
+Now we can filter putative doublets based on the previously determined doublet scores using the filterDoublets() function. This doesn’t physically remove data from the Arrow files but rather tells the ArchRProject to ignore these cells for downstream analysis.
+
+```{r}
+proj <- filterDoublets(ArchRProj = proj)
+```
+
+## Plot Quality Scores
+
+```{r}
+df <- getCellColData(proj, select = c("log10(nFrags)", "TSSEnrichment"))
+
+p <- ggPoint(
+    x = df[,1], 
+    y = df[,2], 
+    colorDensity = TRUE,
+    continuousSet = "sambaNight",
+    xlabel = "Log10 Unique Fragments",
+    ylabel = "TSS Enrichment",
+    xlim = c(log10(500), quantile(df[,1], probs = 0.99)),
+    ylim = c(0, quantile(df[,2], probs = 0.99))
+) + geom_hline(yintercept = 4, lty = "dashed") + geom_vline(xintercept = 3, lty = "dashed")
+
+p
+```
+
+### Plots for each sample for the TSS enrichment scores and log10(unique features)
+
+```{r, fig.height=3, fig.width=12}
+p1 <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "TSSEnrichment",
+    plotAs = "ridges"
+   )
+
+p2 <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "TSSEnrichment",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+
+p3 <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "log10(nFrags)",
+    plotAs = "ridges"
+   )
+
+p4 <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "log10(nFrags)",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+
+ggAlignPlots(p1, p2, p3, p4, type = "h")
+```
+
+### Fragment Size distribution and TSS enrichment
+
+```{r, fig.height3, fig.width=8}
+p1 <- plotFragmentSizes(ArchRProj = proj)
+p2 <- plotTSSEnrichment(ArchRProj = proj,flank = 10000)
+
+ggAlignPlots(p1,p2, type = "h")
+```
+
+## Dimensionality Reduction and Clustering
+
+ArchR implements an iterative LSI dimensionality reduction via the addIterativeLSI() function.
+
+```{r}
+proj <- addIterativeLSI(ArchRProj = proj, useMatrix = "TileMatrix", name = "IterativeLSI")
+```
+
+To call clusters in this reduced dimension sub-space, we use the addClusters() function which uses Seurat’s graph clustering as the default clustering method.
+
+```{r}
+proj <- addClusters(input = proj,
+                    reducedDims = "IterativeLSI",
+                    method = "Seurat",
+                    force = TRUE,
+                    resolution = 0.8)
+```
+
+## Visualizing in a 2D UMAP Embedding
+
+We can visualize our scATAC-seq data using a 2-dimensional representation such as Uniform Manifold Approximation and Projection (UMAP). To do this, we add a UMAP embedding to our ArchRProject object with the addUMAP() function. This function uses the uwot package to perform UMAP.
+
+```{r}
+proj <- addUMAP(ArchRProj = proj, reducedDims = "IterativeLSI")
+```
+
+Using this UMAP, we can visualize various attributes of our cells which are stored in a matrix called cellColData in our ArchRProject. To do this, we use the plotEmbedding() function and we specify the variable to use for coloration via a combination of the colorBy and name parameters.
+
+```{r}
+plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Sample", embedding = "UMAP", verbose=FALSE)
+```
+
+
+```{r}
+plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Clusters", embedding = "UMAP", verbose=FALSE)
+```
+
+
+```{r, fig.width=16,fig.height=4}
+p1 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Sample", embedding = "UMAP")
+p2 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "treatment", embedding = "UMAP")
+p3 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "cell", embedding = "UMAP")
+p4 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Clusters", embedding = "UMAP")
+
+ggAlignPlots(p1, p2, p3, p4, type = "h")
+```
+
+## Cluster/Sample Confusion Matrix
+
+To better understand which samples reside in which clusters, we can create a cluster confusion matrix across each sample using the confusionMatrix() function.
+
+```{r}
+# quantify cells of each sample per cluster
+cells_cluster <- confusionMatrix(paste0(proj$Clusters), paste0(proj$Sample))
+# normalize to 1000 cells per sample
+tmp <- round(t(t(cells_cluster)/colSums(cells_cluster))*1000,3)
+# calculate percentage of cells from sample per cluster 
+scaled_cM <- round((tmp / Matrix::rowSums(tmp))*100,2)
+
+p <- pheatmap::pheatmap(
+    mat = as.matrix(scaled_cM), 
+    color = paletteContinuous("whiteBlue"), 
+    border_color = "black",display_numbers = TRUE,
+)
+p
+```
+
+## Visualization of selected cluster marker genes {.tabset}
+
+We add imputation weights using MAGIC to help smooth the dropout noise in our gene scores.
+
+```{r}
+proj <- addImputeWeights(proj)
+```
+
+### Ifnar1
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Ifnar1"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Ifnar1)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj,
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Ifnar1",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Ifitm2
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Ifitm2"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 5000,
+    downstream = 5000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Ifitm2)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Ifitm2",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Ifitm6
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Ifitm6"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Ifitm6)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Ifitm6",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Il1b
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Il1b"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Il1b)
+```
+
+Violinplot
+
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Il1b",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### C5ar1
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("C5ar1"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$C5ar1)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "C5ar1",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Ngp
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Ngp"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Ngp)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Ngp",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Ltf
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Ltf"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Ltf)
+```
+
+Violinplot
+
+```{r}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Ltf",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+### Camp
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    geneSymbol = c("Camp"),
+    tileSize = 20,
+    sizes = c(20, 2, 3, 4),
+    upstream = 10000,
+    downstream = 10000,
+    minCells = 0
+)
+```
+
+```{r, fig.width=12, fig.height=8}
+grid::grid.newpage()
+grid::grid.draw(p$Camp)
+```
+
+Violinplot
+
+```{r, fig.height=4, fig.width=6}
+p <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Clusters", 
+    colorBy = "GeneScoreMatrix", 
+    name = "Camp",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )
+p
+```
+
+#------------------------------------------------------------------------------
+
+# Gene level analysis
+
+## Infer cluster marker genes
+
+```{r}
+cluster_markersGS <- getMarkerFeatures(
+    ArchRProj = proj, 
+    useMatrix = "GeneScoreMatrix", 
+    groupBy = "Clusters",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon"
+)
+
+cluster_markerList <- getMarkers(cluster_markersGS, cutOff = "FDR <= 0.01 & Log2FC >= 1")
+```
+
+### Heatmap of cluster marker genes
+
+```{r}
+markerGenes  <- c("S100a8",
+                  "Csf2ra",
+                  "Ncf1",
+                  "Ngp",
+                  "Irf1",
+                  "Ccr1",
+                  "Il1b",
+                  "Cxcr2",
+                  "Ltf",
+                  "S100a9",
+                  "Lyz2",
+                  "Camp",
+                  "Ifitm6",
+                  "Junb",
+                  "Csf3r",
+                  "Ifitm2",
+                  "Ifitm5",
+                  "Ncf2",
+                  "Ptgs2",
+                  "C5ar1",
+                  "Cxcl1", 
+                  "Ifitm1", 
+                  "Ifitm3", 
+                  "Ifnar1", 
+                  "Itgb2", 
+                  "Ltbr", 
+                  "Nlrp3",
+                  "Rps2")
+
+heatmapGS <- plotMarkerHeatmap(
+  seMarker = cluster_markersGS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1", 
+  labelMarkers = markerGenes,
+  transpose = TRUE
+)
+```
+
+
+```{r,fig.height=3.75, fig.width= 4}
+p1 <- ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+
+p1
+```
+
+### GSEA of cluster marker genes
+
+```{r}
+present_genes_entrez <- bitr(proj@geneAnnotation$genes$symbol, 
+                             fromType = "SYMBOL", 
+                             toType="ENTREZID", 
+                             OrgDb=org.Mm.eg.db)$ENTREZID
+
+for(i in names(cluster_markerList)){
+  print(i)
+  markers_entrez <- bitr(cluster_markerList[[i]]$name, 
+                         fromType = "SYMBOL", 
+                         toType="ENTREZID", 
+                         OrgDb=org.Mm.eg.db)$ENTREZID
+  print(length(markers_entrez))
+  OrgDb = org.Mm.eg.db
+  
+  results <- list()
+  
+  
+  # GO enrichment
+  GO <- as.data.frame(enrichGO(gene = markers_entrez,
+                               universe = present_genes_entrez,
+                               OrgDb = OrgDb,
+                               ont = "BP",
+                               pAdjustMethod = "bonferroni",
+                               pvalueCutoff  = 0.1,
+                               qvalueCutoff  = 0.1,
+                               readable      = T))
+  if(nrow(GO)>0){GO$cluster <- i}
+  
+  # KEGG enrichment
+  org = "mmu"
+  
+  KEGG <- as.data.frame(enrichKEGG(gene = markers_entrez, 
+                                   organism = org,
+                                   universe = present_genes_entrez, 
+                                   pAdjustMethod = "bonferroni",
+                                   pvalueCutoff  = 0.1,
+                                   qvalueCutoff  = 0.1))
+  if(nrow(KEGG)>0){KEGG$cluster <- i}
+  
+  if(i=="C1"){
+    GOresults <- GO
+    KEGGresults <- KEGG
+  }else{
+    GOresults <- rbind(GOresults, GO)
+    KEGGresults <- rbind(KEGGresults, KEGG)
+  }
+}
+
+GOresults %>% group_by(cluster) %>% top_n(n= 10, wt = GeneRatio) -> tmp
+
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+
+p<- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+  geom_point(aes(size = Count)) +
+  scale_colour_gradientn(colours=c('red', 
+                                   'orange', 
+                                   'darkblue',
+                                   'darkblue'),
+                         limits=c(0,1),
+                         values   = c(0,0.05,0.2,0.5,1),
+                         breaks   = c(0.05,0.2,1),
+                         labels = format(c(0.05,0.2,1))) +
+  ylab(NULL) +
+  theme_bw() +
+  theme(text = element_text(size=12))
+p
+
+# KEGG
+KEGGresults %>% group_by(cluster) %>% top_n(n= 5, wt = GeneRatio) -> tmp
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+
+p<- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+  geom_point(aes(size = Count)) +
+  scale_colour_gradientn(colours=c('red', 
+                                   'orange', 
+                                   'darkblue',
+                                   'darkblue'),
+                         limits=c(0,1),
+                         values   = c(0,0.05,0.2,0.5,1),
+                         breaks   = c(0.05,0.2,1),
+                         labels = format(c(0.05,0.2,1))) +
+  ylab(NULL) +
+  theme_bw() +
+  theme(text = element_text(size=12))
+p
+```
+
+
+## Assigning Clusters with Gene Scores
+
+Now we can overlay our marker gene scores on our 2D UMAP embedding:
+
+```{r}
+p <- plotEmbedding(
+    ArchRProj = proj, 
+    colorBy = "GeneScoreMatrix", 
+    name = c("Il1b","Irf1","S100A8","S100A9","Ngp","Ltf"), 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(proj)
+)
+```
+
+To plot a specific gene we can subset this plot list using the gene name.
+
+```{r}
+p$Ltf
+```
+
+#------------------------------------------------------------------------------
+
+# Peak level analysis
+
+## Pseudobulk of samples
+
+```{r}
+proj <- addGroupCoverages(ArchRProj = proj, groupBy = "Sample")
+```
+
+## MACS2 peak calling
+
+```{r}
+pathToMacs2 <- findMacs2()
+
+proj <- addReproduciblePeakSet(
+   ArchRProj = proj,
+   groupBy = "Sample",
+   reproducibility = "1",
+   pathToMacs2 = pathToMacs2
+)
+ 
+allPeaks <- getPeakSet(proj)
+```
+
+Add peak matrix to project:
+
+```{r}
+proj <- addPeakMatrix(proj)
+```
+
+## Pairwise test between treatment groups
+
+### GMPs
+
+```{r}
+markerPeaks_gmp <- getMarkerFeatures(
+  ArchRProj = proj, 
+  useMatrix = "PeakMatrix",
+  groupBy = "Sample",
+  testMethod = "binomial",
+  maxCells=2000,
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "bgl_gmp",
+  bgdGroups = "pbs_gmp", 
+  binarize=TRUE
+)
+```
+
+#### Annotation
+
+```{r}
+markerList_gmp <- getMarkers(markerPeaks_gmp, 
+                             cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1", 
+                             returnGR = TRUE)
+
+peakAnnotation_markerList_gmp <- annotatePeak(markerList_gmp$bgl_gmp,
+                                              TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, 
+                                              level="gene", annoDb="org.Mm.eg.db")
+
+peakAnnotation_markerList_gmp.df <- as.data.frame(as.GRanges(peakAnnotation_markerList_gmp))
+
+rownames(peakAnnotation_markerList_gmp.df) <- paste(peakAnnotation_markerList_gmp.df$seqnames,
+                                                    peakAnnotation_markerList_gmp.df$start,
+                                                    peakAnnotation_markerList_gmp.df$end, sep="_")
+```
+
+#### Volcano Plot
+
+```{r}
+tmp <- as.data.frame(getMarkers(markerPeaks_gmp, cutOff = "FDR < 1")$bgl)
+tmp$col <- ifelse(tmp$FDR <= 0.01 & tmp$Log2FC >= 1,"up",
+                    ifelse(tmp$FDR <= 0.01 & tmp$Log2FC <= -1,"down",
+                           "n.s."))
+
+p <- ggplot(data=tmp[!(tmp$Log2FC>-1 & tmp$Log2FC< 1 | tmp$FDR > 0.01),], aes(x=Log2FC, y=-log10(FDR))) +
+  scale_x_continuous(limits=c(-5,5))+
+  geom_vline(xintercept = 0, colour="black")+
+  geom_vline(xintercept = c(-1,1), colour="grey")+
+  geom_hline(yintercept=-log(0.01,10),colour="grey")+
+  geom_point(aes(colour=col), size=1) +
+  xlab("log2(FoldChange)") +
+  ylab("-log10(FDR)") +
+  #geom_text_repel(aes(label=label), size=3)+
+  geom_text(aes(1.5, 20, label = sum(FDR <= 0.01 &
+                                    Log2FC >= 1)), 
+            col = "black")+
+  geom_text(aes(-1.5, 20, label = sum(FDR <= 0.01 &
+                                     Log2FC <= -1)), 
+            col = "black")+
+  theme_bw() + scale_color_manual(values=c("n.s."="grey", "up"="firebrick1", "down"="dodgerblue1"))+ theme(legend.position = "none")
+
+p
+```
+
+#### GSEA
+
+```{r}
+present_genes_entrez <- bitr(unique(allPeaks$nearestGene), 
+                             fromType = "SYMBOL", 
+                             toType="ENTREZID", 
+                             OrgDb=org.Mm.eg.db)$ENTREZID
+
+GSEA_peaks_gmp <- scGSEA(input = peakAnnotation_markerList_gmp.df)
+
+dotplotGSEA(x=GSEA_peaks_gmp$GOup)
+```
+
+
+### Neutrophils
+
+```{r}
+markerPeaks_neu <- getMarkerFeatures(
+  ArchRProj = proj, 
+  useMatrix = "PeakMatrix",
+  groupBy = "Sample",
+  testMethod = "binomial",
+  maxCells=2000,
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "bgl_neu",
+  bgdGroups = "pbs_neu", 
+  binarize=TRUE
+)
+```
+
+#### Annotation
+
+```{r}
+markerList_neu <- getMarkers(markerPeaks_neu, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1", returnGR = TRUE)
+
+peakAnnotation_markerList_neu <- annotatePeak(markerList_neu$bgl_neu,
+                                              TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, 
+                                              level="gene", annoDb="org.Mm.eg.db")
+
+peakAnnotation_markerList_neu.df <- as.data.frame(as.GRanges(peakAnnotation_markerList_neu))
+
+rownames(peakAnnotation_markerList_neu.df) <- paste(peakAnnotation_markerList_neu.df$seqnames,
+                                                    peakAnnotation_markerList_neu.df$start,
+                                                    peakAnnotation_markerList_neu.df$end, sep="_")
+```
+
+#### Volcano Plot
+
+```{r}
+tmp <- as.data.frame(getMarkers(markerPeaks_neu, cutOff = "FDR < 1")$bgl)
+tmp$col <- ifelse(tmp$FDR <= 0.01 & tmp$Log2FC >= 1,"up",
+                    ifelse(tmp$FDR <= 0.01 & tmp$Log2FC <= -1,"down",
+                           "n.s."))
+
+
+p <- ggplot(data=tmp[!(tmp$Log2FC>-1 & tmp$Log2FC< 1 | tmp$FDR > 0.01),], aes(x=Log2FC, y=-log10(FDR))) +
+  scale_x_continuous(limits=c(-5,5))+
+  geom_vline(xintercept = 0, colour="black")+
+  geom_vline(xintercept = c(-1,1), colour="grey")+
+  geom_hline(yintercept=-log(0.01,10),colour="grey")+
+  geom_point(aes(colour=col), size=1) +
+  xlab("log2(FoldChange)") +
+  ylab("-log10(FDR)") +
+  #geom_text_repel(aes(label=label), size=3)+
+  geom_text(aes(1.5, 50, label = sum(FDR <= 0.01 &
+                                    Log2FC >= 1)), 
+            col = "black")+
+  geom_text(aes(-1.5, 50, label = sum(FDR <= 0.01 &
+                                     Log2FC <= -1)), 
+            col = "black")+
+  theme_bw() + scale_color_manual(values=c("n.s."="grey", "up"="firebrick1", "down"="dodgerblue1"))+ theme(legend.position = "none")
+
+p
+```
+
+#### GSEA
+
+```{r}
+present_genes_entrez <- bitr(unique(allPeaks$nearestGene), 
+                             fromType = "SYMBOL", 
+                             toType="ENTREZID", 
+                             OrgDb=org.Mm.eg.db)$ENTREZID
+
+GSEA_peaks_neu <- scGSEA(input = peakAnnotation_markerList_neu.df)
+
+dotplotGSEA(x=GSEA_peaks_neu$GOup)
+```
+
+### Combined GSEA visualization for GMPs and Neutrophil accessible regions
+
+```{r}
+a <- GSEA_peaks_gmp$GOup
+a$Cell <- "GMP"
+
+b <- GSEA_peaks_neu$GOup
+b$Cell <- "NEU"
+
+tmp <- rbind(a,b)
+
+
+dotplotGSEA_comb <- function(x,
+                        show=25,
+                        font.size=10,
+                        title=NULL,
+                        title.size=10,
+                        title.width=100,
+                        order="count"){
+  if(nrow(x)<1){
+    print("No enrichment found.")
+  }else{
+    x <- if(nrow(x)>show){x[c(1:show),]}else{x}
+    if(order=="padj"){
+      x <- x[order(x$Count,decreasing=FALSE),]
+      x$Description <- ifelse(nchar(x$Description)>50,
+                              paste(substr(x$Description, 1, 50),"[...]",sep=""),
+                              x$Description)
+      x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+      x <- x[order(x$p.adjust,decreasing=TRUE),]
+      x$Description <- factor(x$Description, levels = unique(x$Description))
+    }
+    if(order=="count"){
+      x <- x[order(x$Count,decreasing=FALSE),]
+      x$Description <- ifelse(nchar(x$Description)>50,
+                              paste(substr(x$Description, 1, 50),"[...]",sep=""),
+                              x$Description)
+      x$Description <- factor(x$Description, levels = unique(x$Description))
+      x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+    }
+    ggplot(x, aes(x = Cell, y = Description, color = p.adjust)) +
+      geom_point(aes(size = Count)) +
+      scale_colour_gradientn(colours=c('red', 
+                                       'orange', 
+                                       'darkblue',
+                                       'darkblue'),
+                             limits=c(0,1),
+                             values   = c(0,0.05,0.2,0.5,1),
+                             breaks   = c(0.05,0.2,1),
+                             labels = format(c(0.05,0.2,1))) +
+      ylab(NULL) +
+      theme_bw() +
+      theme(text = element_text(size=font.size),
+            axis.text.x = element_text(angle = 90)) 
+  }
+}
+
+dotplotGSEA_comb(x=tmp)
+```
+
+# ----------------------------------------------------
+
+# TF binding motif enrichment analysis
+
+```{r}
+proj <- addMotifAnnotations(ArchRProj = proj, motifSet = "homer", name = "Motif_homer",force=TRUE)
+```
+
+```{r}
+motifPositions_homer <- getPositions(proj, name = "Motif_homer")
+```
+
+## GMPs
+
+### homer
+```{r}
+motifsUp_gmp <- peakAnnoEnrichment(
+    seMarker = markerPeaks_gmp,
+    ArchRProj = proj,
+    peakAnnotation = "Motif_homer",
+    cutOff = "FDR <= 0.01 & Log2FC >= 1"
+  )
+
+motifsUp_gmp_homer <- data.frame(TF = rownames(motifsUp_gmp), mlog10Padj = assay(motifsUp_gmp)[,1])
+motifsUp_gmp_homer <- motifsUp_gmp_homer[order(motifsUp_gmp_homer$mlog10Padj, decreasing = TRUE),]
+motifsUp_gmp_homer$rank <- seq_len(nrow(motifsUp_gmp_homer))
+```
+
+```{r, fig.width=6, fig.height=4}
+p1 <- ggplot(motifsUp_gmp_homer, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_text_repel(
+        data = motifsUp_gmp_homer[rev(seq_len(10)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 3,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))+
+  ggtitle("GMP (homer motifs)")
+
+p1
+```
+
+### IRF1.IRF_136 target positions
+
+```{r}
+overlap <- findOverlaps(query = motifPositions_homer$IRF1.IRF_136, 
+                                 subject = markerList_gmp$bgl_gmp, 
+                                 type = "within")
+
+IRF1.IRF_136_GMP_targets <- peakAnnotation_markerList_gmp.df[unique(overlap@to),]
+
+IRF1.IRF_136_GMP_targets
+```
+
+#### Genomic visualization
+
+##### Ifna1
+
+```{r}
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    geneSymbol = c("Ifna1"),
+    features =  SimpleList(bgl_gmp=markerList_gmp$bgl_gmp,
+                           Irf1_motifs = motifPositions_homer$IRF1.IRF_136),
+    tileSize = 5,
+    sizes = c(10, 2, 3, 2),
+    upstream = 1000,
+    downstream = 1000
+)
+```
+
+```{r, fig.width=8, fig.height=4}
+grid::grid.newpage()
+grid::grid.draw(p$Ifna1)
+```
+
+
+# ----------------------------------------------------
+
+# Trajectory Analysis
+
+Add labels for GMPs, Neutrophils and Cluster 5 as intermediate
+
+```{r}
+proj$trajectory <- ifelse(proj$Clusters == "C5", "int", proj$cell)
+
+
+plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "trajectory", embedding = "UMAP")
+```
+
+## Construct trajectory
+
+```{r}
+trajectory <- c("gmp", "int", "neu")
+trajectory
+```
+
+```{r}
+proj <- addTrajectory(
+    ArchRProj = proj, 
+    name = "traj", 
+    groupBy = "trajectory",
+    trajectory = trajectory, 
+    embedding = "UMAP", 
+    useAll = FALSE,
+    force = TRUE
+)
+
+p <- plotTrajectory(proj, 
+                    trajectory = "traj", 
+                    colorBy = "cellColData", 
+                    name = "traj", 
+                    smoothWindow = 2)
+
+p[[1]]
+```
+
+#### Plot Genes  along pseudotime
+
+Genes taken from: https://www.cell.com/immunity/pdfExtended/S1074-7613(18)30038-4
+
+GMP: Irf8, Gata2, Cebpa
+Int: Gfi1, Runx, Ngp
+Neu: Spi1, Il1b, Klf2
+
+```{r}
+p1 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Irf8", continuousSet = "horizonExtra", smoothWindow = 2)
+p2 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Gata2", continuousSet = "horizonExtra", smoothWindow = 2)
+p3 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Cebpa", continuousSet = "horizonExtra", smoothWindow = 2)
+
+p4 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Gfi1", continuousSet = "horizonExtra", smoothWindow = 2)
+p5 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Runx1", continuousSet = "horizonExtra", smoothWindow = 2)
+p6 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Ngp", continuousSet = "horizonExtra", smoothWindow = 2)
+
+p7 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Spi1", continuousSet = "horizonExtra", smoothWindow = 2)
+p8 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Klf2", continuousSet = "horizonExtra", smoothWindow = 2)
+p9 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Il1b", continuousSet = "horizonExtra", smoothWindow = 2)
+
+p10 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Ltf", continuousSet = "horizonExtra", smoothWindow = 2)
+p11 <- plotTrajectory(proj, trajectory = "traj", colorBy = "GeneScoreMatrix", name = "Camp", continuousSet = "horizonExtra", smoothWindow = 2)
+```
+
+```{r, fig.width=10, fig.height=6}
+ggAlignPlots(p1[[2]], p2[[2]], p3[[2]], type = "h")
+ggAlignPlots(p4[[2]], p5[[2]], p6[[2]], type = "h")
+ggAlignPlots(p7[[2]], p8[[2]], p9[[2]], type = "h")
+```
+
+```{r, fig.width=10, fig.height=20}
+ggAlignPlots(p1[[1]], p2[[1]], p3[[1]],p4[[1]] ,type = "v")
+ggAlignPlots(p5[[1]], p6[[1]], p7[[1]], p8[[1]], type = "v")
+ggAlignPlots(p9[[1]], p10[[1]], p11[[1]], p11[[1]],type = "v")
+```
+
+# ----------------------------------------------------
+
+# Save ArchR project
+
+```{r}
+saveArchRProject(ArchRProj = proj, 
+                 outputDirectory = "ArchR_scATAC_kalafati_200616", 
+                 overwrite = FALSE, 
+                 load = TRUE)
+```
+
+# Clean up
+
+```{r}
+Sys.Date()
+sessionInfo()
+```
+
